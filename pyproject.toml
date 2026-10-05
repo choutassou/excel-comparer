@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "excel-comparer"
+version = "0.1.0"
+description = "Read-only side-by-side Excel workbook comparison"
+requires-python = ">=3.11"
+dependencies = ["PySide6>=6.10,<7", "openpyxl>=3.1.5,<4"]
+
+[project.gui-scripts]
+excel-compare = "source.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["source*"]
