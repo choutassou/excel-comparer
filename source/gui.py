@@ -5,15 +5,15 @@ from io import StringIO
 from pathlib import Path
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, QThread, Signal
-from PySide6.QtGui import QAction, QColor, QKeySequence
+from PySide6.QtGui import QAction, QBrush, QColor, QKeySequence
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QDialog, QDialogButtonBox, QFileDialog,
+    QAbstractItemView, QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPushButton,
     QSplitter, QStackedWidget, QTabBar, QTableView, QTextEdit, QVBoxLayout, QWidget,
 )
 from openpyxl.utils import get_column_letter
 
-from .core import Change, Comparison, SheetComparison, compare_files
+from .core import Change, Comparison, SheetComparison, compare_files, compare_workbooks
 
 
 COLORS = {
@@ -21,6 +21,9 @@ COLORS = {
     Change.ADDED: ("#173d32", "#6fe1ad"),
     Change.MODIFIED: ("#44391f", "#ffd36e"),
 }
+# Rows/columns that exist only on the other side are shown as hatched filler.
+FILLER = ("#2e3848", Qt.BrushStyle.BDiagPattern)
+STRUCTURE = {Change.ADDED: "追加された", Change.DELETED: "削除された"}
 
 STYLE = """
 QWidget { background: #10151d; color: #dce4ee; font-family: 'Yu Gothic UI', 'Segoe UI'; font-size: 13px; }
@@ -37,6 +40,7 @@ QLineEdit, QTextEdit { background: #0c1118; border: 1px solid #2c3a4b; border-ra
 QTabBar::tab { padding: 10px 16px; background: #151d28; border-bottom: 2px solid #263243; }
 QTabBar::tab:selected { background: #253043; border-bottom: 2px solid #efc46b; }
 QTabBar::tab:hover { background: #202b3b; }
+QCheckBox { spacing: 8px; }
 QTableView { background: #0e141c; alternate-background-color: #111a25; gridline-color: #202c3b; border: 1px solid #293648; selection-background-color: #365575; selection-color: #ffffff; font-family: 'Consolas', 'Yu Gothic UI'; }
 QHeaderView::section { background: #192331; color: #9eb0c6; border: 0; border-right: 1px solid #293648; border-bottom: 1px solid #293648; padding: 5px; }
 QTableCornerButton::section { background: #192331; border: 1px solid #293648; }
@@ -54,9 +58,13 @@ QMenu::item:selected { background: #344357; }
 
 
 class SheetModel(QAbstractTableModel):
+    """One side of an aligned sheet. Rows/columns are display positions; the
+    headers show the Excel row numbers / column letters of this side."""
+
     def __init__(self, comparison: SheetComparison, side: str, parent=None):
         super().__init__(parent)
         self.comparison = comparison
+        self.side = 0 if side == "left" else 1
         self.sheet = getattr(comparison, side)
 
     def rowCount(self, parent=QModelIndex()):
@@ -65,25 +73,45 @@ class SheetModel(QAbstractTableModel):
     def columnCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else self.comparison.columns
 
+    def address(self, index) -> tuple[int, int] | None:
+        return self.comparison.source(self.side, index.row() + 1, index.column() + 1)
+
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid():
             return None
-        address = (index.row() + 1, index.column() + 1)
-        value = self.sheet.cells.get(address) if self.sheet else None
-        change = self.comparison.changes.get(address)
+        row, column = index.row() + 1, index.column() + 1
+        address = self.address(index)
+        value = self.sheet.cells.get(address) if self.sheet and address else None
+        line = self.comparison.row_status(row)
+        line_label = "行" if line else "列"
+        line = line or self.comparison.column_status(column)
+        change = line or self.comparison.changes.get((row, column))
         if role == Qt.ItemDataRole.DisplayRole:
             return value.text if value else ""
         if role == Qt.ItemDataRole.ToolTipRole:
-            return f"{get_column_letter(address[1])}{address[0]}" + (f" · {change.value}" if change else "") + f"\n{value.text if value else '（空白）'}"
-        if change and role == Qt.ItemDataRole.BackgroundRole:
-            return QColor(COLORS[change][0])
-        if change and role == Qt.ItemDataRole.ForegroundRole:
+            if address is None:
+                return f"この側にはない{line_label}（{'右' if self.side == 0 else '左'}側に{STRUCTURE[line]}{line_label}）"
+            label = f"{STRUCTURE[line]}{line_label}" if line else change.value if change else ""
+            return f"{get_column_letter(address[1])}{address[0]}" + (f" · {label}" if label else "") + f"\n{value.text if value else '（空白）'}"
+        if role == Qt.ItemDataRole.BackgroundRole:
+            if address is None:
+                return QBrush(QColor(FILLER[0]), FILLER[1])
+            return QColor(COLORS[change][0]) if change else None
+        if change and address is not None and role == Qt.ItemDataRole.ForegroundRole:
             return QColor(COLORS[change][1])
         return None
 
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        horizontal = orientation == Qt.Orientation.Horizontal
+        mapping = self.comparison.col_map if horizontal else self.comparison.row_map
+        if section >= len(mapping):
+            return None
+        actual = mapping[section][self.side]
         if role == Qt.ItemDataRole.DisplayRole:
-            return get_column_letter(section + 1) if orientation == Qt.Orientation.Horizontal else str(section + 1)
+            return "" if actual is None else get_column_letter(actual) if horizontal else str(actual)
+        if role == Qt.ItemDataRole.ToolTipRole:
+            status = (self.comparison.column_status if horizontal else self.comparison.row_status)(section + 1)
+            return f"{STRUCTURE[status]}{'列' if horizontal else '行'}" if status else None
         return None
 
 
@@ -135,7 +163,7 @@ class CellTable(QTableView):
 
 
 class OpenDialog(QDialog):
-    def __init__(self, paths=None, parent=None):
+    def __init__(self, paths=None, parent=None, align=True):
         super().__init__(parent)
         self.setWindowTitle("比較するファイルを開く")
         self.resize(750, 300)
@@ -143,7 +171,7 @@ class OpenDialog(QDialog):
         title = QLabel("2つのExcelファイルを比較")
         title.setObjectName("title")
         layout.addWidget(title)
-        layout.addWidget(QLabel("左を比較元、右を比較先として、同名シート・同じセル位置の値を比較します。"))
+        layout.addWidget(QLabel("左を比較元、右を比較先として、同名シートの値を比較します。"))
         self.fields = []
         for i, label in enumerate(("左側（比較元）", "右側（比較先）")):
             layout.addWidget(QLabel(label))
@@ -159,6 +187,9 @@ class OpenDialog(QDialog):
         swap = QPushButton("左右を入れ替え")
         swap.clicked.connect(self.swap)
         layout.addWidget(swap, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.align_box = QCheckBox("行・列の挿入／削除を検出して位置を揃える（オフ: 同じセル位置どうしを比較）")
+        self.align_box.setChecked(align)
+        layout.addWidget(self.align_box)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("比較")
         buttons.button(QDialogButtonBox.StandardButton.Ok).setObjectName("primary")
@@ -196,13 +227,13 @@ class LoadThread(QThread):
     failed = Signal(str)
     progress = Signal(str)
 
-    def __init__(self, paths, parent=None):
+    def __init__(self, task, parent=None):
         super().__init__(parent)
-        self.paths = paths
+        self.task = task
 
     def run(self):
         try:
-            self.loaded.emit(compare_files(*self.paths, progress=self.progress.emit))
+            self.loaded.emit(self.task(self.progress.emit))
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -250,6 +281,11 @@ class MainWindow(QMainWindow):
         self.summary = QLabel("ファイルを選択して比較を開始")
         summary_row.addWidget(self.summary)
         summary_row.addStretch()
+        self.align_box = QCheckBox("行・列のズレを検出")
+        self.align_box.setChecked(True)
+        self.align_box.setToolTip("オン: 挿入・削除された行／列を検出して左右の位置を揃えます\nオフ: 同じセル位置どうしを比較します")
+        self.align_box.toggled.connect(self.recompare)
+        summary_row.addWidget(self.align_box)
         self.previous = QPushButton("‹  前の差分")
         self.next = QPushButton("次の差分  ›")
         self.previous.clicked.connect(lambda: self.navigate(-1))
@@ -272,7 +308,7 @@ class MainWindow(QMainWindow):
         label = QLabel("Excelファイルを並べて比較")
         label.setObjectName("emptyTitle")
         empty_layout.addWidget(label, alignment=Qt.AlignmentFlag.AlignCenter)
-        hint = QLabel("削除は赤、追加は緑、変更は黄色で表示します。\n\n.xlsx / .xlsm  ·  表示専用  ·  セルのコピーに対応")
+        hint = QLabel("削除は赤、追加は緑、変更は黄色で表示します。\n挿入・削除された行／列も検出し、反対側には斜線の空行／空列を表示します。\n\n.xlsx / .xlsm  ·  表示専用  ·  セルのコピーに対応")
         hint.setObjectName("muted")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         empty_layout.addWidget(hint)
@@ -317,7 +353,7 @@ class MainWindow(QMainWindow):
             action.setShortcut(QKeySequence(key))
             action.triggered.connect(callback)
             self.addAction(action)
-        self.statusBar().showMessage("表示専用  •  同名シートの同じセル位置を比較  •  Ctrl+O: 開く")
+        self.statusBar().showMessage("表示専用  •  行・列の挿入／削除を検出して比較  •  Ctrl+O: 開く")
 
     def sync_scroll(self, peer, value):
         if self._syncing:
@@ -334,21 +370,39 @@ class MainWindow(QMainWindow):
         if self.worker and self.worker.isRunning():
             return
         paths = (str(self.comparison.left.path), str(self.comparison.right.path)) if self.comparison else None
-        dialog = OpenDialog(paths, self)
+        dialog = OpenDialog(paths, self, self.align_box.isChecked())
         if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.set_align(dialog.align_box.isChecked())
             self.load_files(*dialog.paths())
+
+    def set_align(self, value):
+        self.align_box.blockSignals(True)
+        self.align_box.setChecked(value)
+        self.align_box.blockSignals(False)
+
+    def recompare(self):
+        """Re-run the comparison on the loaded snapshots after toggling alignment."""
+        if not self.comparison or (self.worker and self.worker.isRunning()):
+            return
+        left, right, align = self.comparison.left, self.comparison.right, self.align_box.isChecked()
+        self.start_worker(lambda progress: compare_workbooks(left, right, align, progress), "差分を解析しています…")
 
     def refresh(self):
         if self.comparison:
             self.load_files(str(self.comparison.left.path), str(self.comparison.right.path))
 
     def load_files(self, left, right):
+        align = self.align_box.isChecked()
+        self.start_worker(lambda progress: compare_files(left, right, progress, align), "Excelファイルを読み込んでいます…")
+
+    def start_worker(self, task, message):
         if self.worker and self.worker.isRunning():
             return
         self.open_button.setEnabled(False)
         self.refresh_button.setEnabled(False)
-        self.statusBar().showMessage("Excelファイルを読み込んでいます…")
-        self.worker = LoadThread((left, right), self)
+        self.align_box.setEnabled(False)
+        self.statusBar().showMessage(message)
+        self.worker = LoadThread(task, self)
         self.worker.progress.connect(self.statusBar().showMessage)
         self.worker.loaded.connect(self.apply_comparison)
         self.worker.failed.connect(self.load_failed)
@@ -358,6 +412,9 @@ class MainWindow(QMainWindow):
     def load_finished(self):
         self.open_button.setEnabled(True)
         self.refresh_button.setEnabled(self.comparison is not None)
+        self.align_box.setEnabled(True)
+        if self.comparison:
+            self.set_align(self.comparison.aligned)
         self.worker.deleteLater()
         self.worker = None
 
@@ -378,11 +435,19 @@ class MainWindow(QMainWindow):
             previous_name = None
         self.current_sheet = None
         self.comparison = comparison
-        self.changes = [(i, address) for i, sheet in enumerate(comparison.sheets) for address in sheet.changes]
+        self.changes = [(i, address) for i, sheet in enumerate(comparison.sheets) for address in sheet.stops]
         self.change_index = -1
         self.previous.setEnabled(bool(self.changes))
         self.next.setEnabled(bool(self.changes))
-        self.summary.setText("　　".join(f'<span style="color:{COLORS[kind][1]}">● {count:,} {kind.value}</span>' for kind, count in comparison.counts.items()))
+        summary = "　　".join(f'<span style="color:{COLORS[kind][1]}">● {count:,} {kind.value}</span>' for kind, count in comparison.counts.items())
+        if comparison.aligned:
+            structure = comparison.structure
+            summary += "　　|　　" + "　　".join(
+                f'{axis}  <span style="color:{COLORS[Change.ADDED][1]}">+{structure[key + "_added"]:,}</span>'
+                f' / <span style="color:{COLORS[Change.DELETED][1]}">−{structure[key + "_deleted"]:,}</span>'
+                for axis, key in (("行", "rows"), ("列", "columns")))
+        self.summary.setText(summary)
+        self.set_align(comparison.aligned)
         for label, book in zip(self.path_labels, (comparison.left, comparison.right)):
             label.setText(str(book.path))
             label.setToolTip(str(book.path))
@@ -393,9 +458,12 @@ class MainWindow(QMainWindow):
         selected = 0
         for i, sheet in enumerate(comparison.sheets):
             suffix = " · 左のみ" if sheet.right is None else " · 右のみ" if sheet.left is None else ""
-            self.tabs.addTab(f"{sheet.name}{suffix}" + (f"  ({len(sheet.changes)})" if sheet.changes else ""))
-            self.tabs.setTabTextColor(i, QColor("#ffd36e" if sheet.changes or suffix else "#96a8bf"))
-            self.tabs.setTabToolTip(i, " / ".join(f"{n} {k.value}" for k, n in sheet.counts.items()) + suffix)
+            self.tabs.addTab(f"{sheet.name}{suffix}" + (f"  ({sheet.total})" if sheet.total else ""))
+            self.tabs.setTabTextColor(i, QColor("#ffd36e" if sheet.total or suffix else "#96a8bf"))
+            structure = sheet.structure
+            self.tabs.setTabToolTip(i, " / ".join(f"{n} {k.value}" for k, n in sheet.counts.items()) + suffix + (
+                f"\n行 +{structure['rows_added']} / −{structure['rows_deleted']}　列 +{structure['columns_added']} / −{structure['columns_deleted']}"
+                if comparison.aligned else ""))
             if sheet.name == previous_name:
                 selected = i
         self.tabs.setCurrentIndex(selected)
@@ -421,7 +489,7 @@ class MainWindow(QMainWindow):
             if old_selection:
                 old_selection.deleteLater()
             table.selectionModel().currentChanged.connect(lambda current, previous, side_index=i: self.show_cell(side_index, current))
-            self.sheet_labels[i].setText("この側にはシートがありません" if getattr(sheet, side) is None else f"{sheet.name}  ·  {len(sheet.changes):,} 箇所の差分")
+            self.sheet_labels[i].setText("この側にはシートがありません" if getattr(sheet, side) is None else f"{sheet.name}  ·  {sheet.total:,} 箇所の差分")
         for table in self.tables:
             table.doItemsLayout()
             x, y = self.positions.get(sheet.name, (0, 0))
@@ -432,7 +500,9 @@ class MainWindow(QMainWindow):
     def show_cell(self, side, index):
         if not index.isValid():
             return
-        self.cell_label.setText(f"{'左' if side == 0 else '右'} · {get_column_letter(index.column() + 1)}{index.row() + 1}  —  セルの内容")
+        address = index.model().address(index)
+        where = f"{get_column_letter(address[1])}{address[0]}" if address else "（この側にはない行／列）"
+        self.cell_label.setText(f"{'左' if side == 0 else '右'} · {where}  —  セルの内容")
         self.cell_text.setPlainText(index.data() or "")
 
     def navigate(self, direction):
@@ -445,7 +515,11 @@ class MainWindow(QMainWindow):
             index = table.model().index(row - 1, col - 1)
             table.setCurrentIndex(index)
             table.scrollTo(index, QAbstractItemView.ScrollHint.PositionAtCenter)
-        self.statusBar().showMessage(f"差分 {self.change_index + 1} / {len(self.changes)}  •  {self.current_sheet} ! {get_column_letter(col)}{row}")
+        sheet = self.comparison.sheets[sheet_index]
+        where = "  /  ".join(
+            f"{label} {get_column_letter(address[1])}{address[0]}" if address else f"{label} —"
+            for label, address in (("左", sheet.source(0, row, col)), ("右", sheet.source(1, row, col))))
+        self.statusBar().showMessage(f"差分 {self.change_index + 1} / {len(self.changes)}  •  {self.current_sheet}  •  {where}")
 
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():
